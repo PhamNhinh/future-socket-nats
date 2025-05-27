@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  nats:
+    image: nats:latest
+    container_name: nats-server
+    ports:
+      - "4222:4222"  # Client connections
+      - "8222:8222"  # HTTP monitoring port
+    networks:
+      - app-network
+    restart: always
+
+  app:
+    build: .
+    container_name: binance-websocket-server
+    environment:
+      - NODE_ENV=production
+      - NATS_URL=nats://nats:4222
+      - WS_PORT=8081
+      - SYMBOLS_PER_WORKER=100
+      - LOG_LEVEL=info
+      - USE_FUTURES=true
+    ports:
+      - "8081:8081"
+    depends_on:
+      - nats
+    networks:
+      - app-network
+    restart: always
+    volumes:
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  # Dịch vụ quản lý và giám sát (tùy chọn)
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    ports:
+      - "9000:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - app-network
+    restart: always
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  portainer_data: 
