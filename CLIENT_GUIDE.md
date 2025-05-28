@@ -27,7 +27,7 @@ Hệ thống được thiết kế để xử lý số lượng lớn kết nố
 ## Thông tin kết nối
 
 - **WebSocket URL**: `ws://server-address:8081`
-- **Cổng mặc định**: 8080
+- **Cổng mặc định**: 8081
 - **Giao thức**: WebSocket (ws:// hoặc wss:// nếu hỗ trợ SSL)
 
 ## Giao thức WebSocket

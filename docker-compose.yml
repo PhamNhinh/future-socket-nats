@@ -17,12 +17,12 @@ services:
     environment:
       - NODE_ENV=production
       - NATS_URL=nats://nats:4222
-      - WS_PORT=8081
+      - WS_PORT=8082
       - SYMBOLS_PER_WORKER=100
       - LOG_LEVEL=info
       - USE_FUTURES=true
     ports:
-      - "8081:8081"
+      - "8082:8082"
     depends_on:
       - nats
     networks:
