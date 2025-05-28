@@ -22,11 +22,13 @@ async function initializeServer() {
     
     // Fetch available trading symbols from Binance
     let symbols;
+    const binanceService = new BinanceService();
+    
     if (USE_FUTURES) {
-      symbols = await BinanceService.fetchFutureSymbols();
+      symbols = await binanceService.fetchFutureSymbols();
       logger.info(`Loaded ${symbols.length} future trading symbols from Binance`);
     } else {
-      symbols = await BinanceService.fetchSymbols();
+      symbols = await binanceService.fetchSymbols();
       logger.info(`Loaded ${symbols.length} spot trading symbols from Binance`);
     }
     

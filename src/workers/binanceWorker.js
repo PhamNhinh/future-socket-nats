@@ -1,7 +1,7 @@
 import { parentPort, workerData } from 'worker_threads';
 import { BinanceService } from '../services/binanceService.js';
 import { NatsService } from '../services/natsService.js';
-import { NATS_SUBJECTS, STREAM_TYPES } from '../utils/config.js';
+import { NATS_SUBJECTS, STREAM_TYPES, WS_CONNECTION } from '../utils/config.js';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('BinanceWorker');
@@ -90,7 +90,7 @@ function handleControlMessage(message) {
 /**
  * Handle subscribe request
  */
-function handleSubscribeRequest(message) {
+async function handleSubscribeRequest(message) {
   const { streamType, symbols: requestedSymbols, options } = message;
   
   if (!STREAM_TYPES.includes(streamType)) {
@@ -121,59 +121,78 @@ function handleSubscribeRequest(message) {
     );
   }
   
-  // Check if we already have a connection for this stream type
-  if (!activeConnections.has(streamType)) {
-    // Create new WebSocket connection
-    const ws = BinanceService.createWebSocketConnection(streams, isFutures);
-    
-    // Setup WebSocket event handlers
-    setupWebSocketHandlers(ws, streamType);
-    
-    // Store the connection
-    activeConnections.set(streamType, ws);
-    
-    // Initialize subscriptions map for this stream type
-    activeSubscriptions.set(streamType, new Set(symbolsToSubscribe));
-    
-  } else {
-    // We need to modify the existing connection
-    logger.info(`Updating existing ${streamType} connection`);
-    
-    const existingConnection = activeConnections.get(streamType);
-    const existingSubscriptions = activeSubscriptions.get(streamType);
-    
-    // Add new symbols to the subscriptions
-    symbolsToSubscribe.forEach(symbol => existingSubscriptions.add(symbol));
-    
-    // Close existing connection
-    existingConnection.close();
-    
-    // Create new streams list with all subscribed symbols
-    let allStreams;
-    if (streamType === 'liquidation' && isFutures) {
-      // Liquidation stream is a single stream for all symbols
-      allStreams = [BinanceService.getLiquidationStreamName()];
+  try {
+    // Check if we already have a connection for this stream type
+    if (!activeConnections.has(streamType)) {
+      // Create new WebSocket connection
+      logger.info(`Creating new WebSocket connection for ${streamType} with ${streams.length} streams`);
+      const ws = await BinanceService.createWebSocketConnection(streams, isFutures);
+      
+      // Setup WebSocket event handlers
+      setupWebSocketHandlers(ws, streamType);
+      
+      // Store the connection
+      activeConnections.set(streamType, ws);
+      
+      // Initialize subscriptions map for this stream type
+      activeSubscriptions.set(streamType, new Set(symbolsToSubscribe));
+      
     } else {
-      allStreams = Array.from(existingSubscriptions).map(symbol => 
-        BinanceService.getStreamName(streamType, symbol, options)
-      );
+      // We need to modify the existing connection
+      logger.info(`Updating existing ${streamType} connection for ${symbolsToSubscribe.length} new symbols`);
+      
+      const existingConnection = activeConnections.get(streamType);
+      const existingSubscriptions = activeSubscriptions.get(streamType);
+      
+      // Add new symbols to the subscriptions
+      symbolsToSubscribe.forEach(symbol => existingSubscriptions.add(symbol));
+      
+      // Create new streams list with all subscribed symbols
+      let allStreams;
+      if (streamType === 'liquidation' && isFutures) {
+        // Liquidation stream is a single stream for all symbols
+        allStreams = [BinanceService.getLiquidationStreamName()];
+      } else {
+        allStreams = Array.from(existingSubscriptions).map(symbol => 
+          BinanceService.getStreamName(streamType, symbol, options)
+        );
+      }
+      
+      logger.info(`Recreating WebSocket connection for ${streamType} with ${allStreams.length} total streams`);
+      
+      try {
+        // Create new WebSocket connection with all streams
+        const newWs = await BinanceService.createWebSocketConnection(allStreams, isFutures);
+        
+        // Setup WebSocket event handlers
+        setupWebSocketHandlers(newWs, streamType);
+        
+        // Add a delay before closing old connection to ensure new one is fully established
+        logger.info(`New connection established, waiting before closing old connection for ${streamType}`);
+        
+        // Wait for a short time to ensure connection is fully established and ready
+        await new Promise(resolve => setTimeout(resolve, WS_CONNECTION.CONNECTION_SWITCH_DELAY_MS));
+        
+        // Close existing connection AFTER new one is established and short delay
+        logger.info(`Closing old connection for ${streamType}`);
+        existingConnection.close();
+        
+        // Update the connection
+        activeConnections.set(streamType, newWs);
+      } catch (error) {
+        logger.error(`Failed to update connection for ${streamType}, keeping existing connection: ${error.message}`);
+        // Keep the existing connection
+      }
     }
-    
-    // Create new WebSocket connection with all streams
-    const newWs = BinanceService.createWebSocketConnection(allStreams, isFutures);
-    
-    // Setup WebSocket event handlers
-    setupWebSocketHandlers(newWs, streamType);
-    
-    // Update the connection
-    activeConnections.set(streamType, newWs);
+  } catch (error) {
+    logger.error(`Error creating WebSocket connection for ${streamType}: ${error.message}`);
   }
 }
 
 /**
  * Handle unsubscribe request
  */
-function handleUnsubscribeRequest(message) {
+async function handleUnsubscribeRequest(message) {
   const { streamType, symbols: symbolsToUnsubscribe } = message;
   
   if (!activeConnections.has(streamType)) {
@@ -204,23 +223,36 @@ function handleUnsubscribeRequest(message) {
     return;
   }
   
-  // Otherwise, update the connection with remaining symbols
-  // Close existing connection
-  existingConnection.close();
-  
-  // Create new streams list with remaining subscribed symbols
-  const remainingStreams = Array.from(existingSubscriptions).map(symbol => 
-    BinanceService.getStreamName(streamType, symbol)
-  );
-  
-  // Create new WebSocket connection with remaining streams
-  const newWs = BinanceService.createWebSocketConnection(remainingStreams, isFutures);
-  
-  // Setup WebSocket event handlers
-  setupWebSocketHandlers(newWs, streamType);
-  
-  // Update the connection
-  activeConnections.set(streamType, newWs);
+  try {
+    // Create new streams list with remaining subscribed symbols
+    const remainingStreams = Array.from(existingSubscriptions).map(symbol => 
+      BinanceService.getStreamName(streamType, symbol)
+    );
+    
+    logger.info(`Recreating WebSocket connection for ${streamType} with ${remainingStreams.length} remaining streams`);
+    
+    // Create new WebSocket connection with remaining streams
+    const newWs = await BinanceService.createWebSocketConnection(remainingStreams, isFutures);
+    
+    // Setup WebSocket event handlers
+    setupWebSocketHandlers(newWs, streamType);
+    
+    // Add a delay before closing old connection to ensure new one is fully established
+    logger.info(`New connection established, waiting before closing old connection for ${streamType}`);
+    
+    // Wait for a short time to ensure connection is fully established and ready
+    await new Promise(resolve => setTimeout(resolve, WS_CONNECTION.CONNECTION_SWITCH_DELAY_MS));
+    
+    // Close existing connection AFTER new one is established and short delay
+    logger.info(`Closing old connection for ${streamType}`);
+    existingConnection.close();
+    
+    // Update the connection
+    activeConnections.set(streamType, newWs);
+  } catch (error) {
+    logger.error(`Failed to update connection for ${streamType} after unsubscribe, keeping existing connection: ${error.message}`);
+    // Keep the existing connection
+  }
 }
 
 /**

@@ -172,6 +172,13 @@ function handleMessage(message) {
       }
       break;
       
+    case 'historicalKlines':
+      console.log(`Received historical klines for ${data.symbol} (${data.interval})`);
+      if (historicalDataResolve) {
+        historicalDataResolve(data);
+      }
+      break;
+      
     default:
       console.log('Received message:', message);
   }
@@ -189,7 +196,8 @@ function showMenu() {
   console.log('5. Change market type');
   console.log('6. Subscribe to raw streams');
   console.log('7. Unsubscribe from raw streams');
-  console.log('8. Exit');
+  console.log('8. Fetch historical klines');
+  console.log('9. Exit');
   console.log('-----------');
   
   rl.question('Select an option: ', (answer) => {
@@ -223,6 +231,10 @@ function showMenu() {
         break;
         
       case '8':
+        handleHistoricalKlinesRequest();
+        break;
+        
+      case '9':
         console.log('Exiting...');
         ws.close();
         rl.close();
@@ -349,62 +361,136 @@ function handleSubscribe() {
     return;
   }
   
-  rl.question('Enter symbols to subscribe (comma-separated, or press enter for defaults): ', (answer) => {
-    let symbols = answer.trim() ? answer.split(',').map(s => s.trim().toLowerCase()) : DEFAULT_SYMBOLS;
-    
-    let options = {};
-    if (currentStreamType === 'kline') {
-      rl.question('Enter interval (1m, 5m, 15m, 1h, etc.) [default: 1m]: ', (interval) => {
-        options = { interval: interval.trim() || '1m' };
-        
-        // Send subscription request
-        ws.send(JSON.stringify({
-          type: 'subscribe',
-          streamType: currentStreamType,
-          symbols,
-          options
-        }));
-        
-        showMenu();
+  console.log('Options:');
+  console.log('1. Subscribe to specific symbols');
+  console.log('2. Subscribe to ALL available symbols (high data volume!)');
+  
+  rl.question('Select option: ', (answer) => {
+    if (answer === '2') {
+      console.log('WARNING: Subscribing to ALL symbols will generate a large volume of data!');
+      rl.question('Are you sure? (y/n): ', (confirm) => {
+        if (confirm.toLowerCase() === 'y') {
+          subscribeToAllSymbols();
+        } else {
+          handleSubscribe();
+        }
       });
-    } else if (currentStreamType === 'depth') {
-      rl.question('Enter depth level (5, 10, 20) [default: 20]: ', (level) => {
-        options = { level: level.trim() || '20' };
-        
-        // Send subscription request
-        ws.send(JSON.stringify({
-          type: 'subscribe',
-          streamType: currentStreamType,
-          symbols,
-          options
-        }));
-        
-        showMenu();
-      });
-    } else if (currentStreamType === 'markPrice' && isFutures) {
-      options = { updateSpeed: '1s' };
-      
-      // Send subscription request
-      ws.send(JSON.stringify({
-        type: 'subscribe',
-        streamType: currentStreamType,
-        symbols,
-        options
-      }));
-      
-      showMenu();
-    } else {
-      // Send subscription request
-      ws.send(JSON.stringify({
-        type: 'subscribe',
-        streamType: currentStreamType,
-        symbols,
-        options
-      }));
-      
-      showMenu();
+      return;
     }
+    
+    // Original flow for specific symbols
+    rl.question('Enter symbols to subscribe (comma-separated, or press enter for defaults): ', (answer) => {
+      let symbols = answer.trim() ? answer.split(',').map(s => s.trim().toLowerCase()) : DEFAULT_SYMBOLS;
+      
+      handleSymbolOptions(symbols);
+    });
   });
+}
+
+/**
+ * Subscribe to ALL symbols for current stream type
+ */
+function subscribeToAllSymbols() {
+  let options = {};
+  
+  if (currentStreamType === 'kline') {
+    rl.question('Enter interval (1m, 5m, 15m, 1h, etc.) [default: 1m]: ', (interval) => {
+      options = { interval: interval.trim() || '1m' };
+      
+      // Send subscription request for ALL symbols
+      ws.send(JSON.stringify({
+        type: 'subscribe',
+        streamType: currentStreamType,
+        symbols: ['ALL'],
+        options
+      }));
+      
+      showMenu();
+    });
+  } else if (currentStreamType === 'depth') {
+    rl.question('Enter depth level (5, 10, 20) [default: 20]: ', (level) => {
+      options = { level: level.trim() || '20' };
+      
+      // Send subscription request for ALL symbols
+      ws.send(JSON.stringify({
+        type: 'subscribe',
+        streamType: currentStreamType,
+        symbols: ['all'],
+        options
+      }));
+      
+      showMenu();
+    });
+  } else {
+    // Send subscription request for ALL symbols
+    ws.send(JSON.stringify({
+      type: 'subscribe',
+      streamType: currentStreamType,
+      symbols: ['ALL'],
+      options
+    }));
+    
+    showMenu();
+  }
+}
+
+/**
+ * Handle symbol options based on stream type
+ */
+function handleSymbolOptions(symbols) {
+  let options = {};
+  
+  if (currentStreamType === 'kline') {
+    rl.question('Enter interval (1m, 5m, 15m, 1h, etc.) [default: 1m]: ', (interval) => {
+      options = { interval: interval.trim() || '1m' };
+      
+      // Send subscription request
+      ws.send(JSON.stringify({
+        type: 'subscribe',
+        streamType: currentStreamType,
+        symbols,
+        options
+      }));
+      
+      showMenu();
+    });
+  } else if (currentStreamType === 'depth') {
+    rl.question('Enter depth level (5, 10, 20) [default: 20]: ', (level) => {
+      options = { level: level.trim() || '20' };
+      
+      // Send subscription request
+      ws.send(JSON.stringify({
+        type: 'subscribe',
+        streamType: currentStreamType,
+        symbols,
+        options
+      }));
+      
+      showMenu();
+    });
+  } else if (currentStreamType === 'markPrice' && isFutures) {
+    options = { updateSpeed: '1s' };
+    
+    // Send subscription request
+    ws.send(JSON.stringify({
+      type: 'subscribe',
+      streamType: currentStreamType,
+      symbols,
+      options
+    }));
+    
+    showMenu();
+  } else {
+    // Send subscription request
+    ws.send(JSON.stringify({
+      type: 'subscribe',
+      streamType: currentStreamType,
+      symbols,
+      options
+    }));
+    
+    showMenu();
+  }
 }
 
 /**
@@ -486,6 +572,55 @@ function showSubscriptions() {
   console.log(`Subscribed raw streams: ${subscribedRawStreams.length > 0 ? subscribedRawStreams.join(', ') : 'None'}`);
   showMenu();
 }
+
+/**
+ * Fetch historical klines (candlestick data)
+ */
+async function handleHistoricalKlinesRequest() {
+  console.log('\n=== FETCH HISTORICAL KLINES ===');
+  
+  const symbol = await promptInput('Enter symbol (e.g. btcusdt): ');
+  const interval = await promptInput('Enter interval (1m, 5m, 15m, 1h, 4h, 1d): ');
+  const limit = parseInt(await promptInput('Enter number of candles (max 1000): '), 10) || 100;
+  const isFutures = marketType === 'futures';
+  
+  console.log(`Fetching ${limit} ${interval} klines for ${symbol}...`);
+  
+  // Send request to server
+  ws.send(JSON.stringify({
+    type: 'getHistoricalKlines',
+    symbol,
+    interval,
+    limit: Math.min(limit, 1000), // Enforce limit on client side too
+    isFutures
+  }));
+  
+  // Wait for response
+  historicalDataPromise = new Promise((resolve) => {
+    historicalDataResolve = resolve;
+  });
+  
+  const result = await historicalDataPromise;
+  historicalDataPromise = null;
+  
+  // Display results
+  console.log(`Received ${result.klines.length} klines for ${symbol}`);
+  
+  // Display a few samples
+  const samples = result.klines.slice(0, 5);
+  console.log('Sample data (first 5 candles):');
+  samples.forEach((kline, index) => {
+    const [time, open, high, low, close] = kline;
+    const date = new Date(time).toISOString();
+    console.log(`${index + 1}. ${date} - O: ${open}, H: ${high}, L: ${low}, C: ${close}`);
+  });
+  
+  return showMainMenu();
+}
+
+// Add to global variables
+let historicalDataPromise = null;
+let historicalDataResolve = null;
 
 // Start the client
 connect(); 

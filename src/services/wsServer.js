@@ -1,6 +1,7 @@
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { NATS_SUBJECTS, MESSAGE_TYPES, STREAM_TYPES } from '../utils/config.js';
 import { createLogger } from '../utils/logger.js';
+import { BinanceService } from '../services/binanceService.js';
 
 const logger = createLogger('WebSocketServer');
 
@@ -97,6 +98,10 @@ export class WSServer {
           } else {
             this._handleUnsubscribe(clientId, data);
           }
+          break;
+          
+        case MESSAGE_TYPES.GET_HISTORICAL_KLINES:
+          this._handleHistoricalKlinesRequest(clientId, data);
           break;
           
         default:
@@ -320,20 +325,99 @@ export class WSServer {
   }
 
   /**
-   * Handle a client's subscription request
+   * Handle subscribe request
    */
   _handleSubscribe(clientId, data) {
-    const { streamType, symbols, options } = data;
+    const { streamType, symbols = [], options = {} } = data;
     
     // Validate stream type
-    if (!STREAM_TYPES.includes(streamType)) {
+    if (!Object.values(STREAM_TYPES).includes(streamType)) {
       this._sendErrorToClient(clientId, `Invalid stream type: ${streamType}`);
       return;
     }
     
-    // Validate symbols
-    if (!Array.isArray(symbols) || symbols.length === 0) {
-      this._sendErrorToClient(clientId, 'Symbols must be a non-empty array');
+    // Special case for global streams like liquidation
+    if (symbols.length === 1 && symbols[0] === '_global_') {
+      logger.info(`Client ${clientId} subscribing to global ${streamType} stream`);
+      
+      const client = this.clients.get(clientId);
+      
+      // Initialize client's subscriptions for this stream type if needed
+      if (!client.subscriptions.has(streamType)) {
+        client.subscriptions.set(streamType, new Set());
+      }
+      
+      // Add special symbol to client's subscriptions
+      client.subscriptions.get(streamType).add('_global_');
+      
+      // Initialize subscriptions for this symbol if needed
+      const key = `${streamType}:_global_`;
+      if (!this.subscriptions.has(key)) {
+        this.subscriptions.set(key, new Set());
+      }
+      
+      // Add client to symbol's subscribers
+      this.subscriptions.get(key).add(clientId);
+      
+      // Subscribe via worker manager
+      this.workerManager.subscribeToStream(streamType, ['_global_'], options);
+      
+      // Acknowledge the subscription
+      this._sendToClient(client.ws, {
+        type: MESSAGE_TYPES.SUBSCRIBED,
+        streamType,
+        symbols: ['_global_']
+      });
+      
+      return;
+    }
+
+    // Special case for subscribing to ALL symbols
+    if (symbols.length === 1 && symbols[0].toUpperCase() === 'ALL') {
+      logger.info(`Client ${clientId} subscribing to ALL symbols for ${streamType}`);
+      
+      const client = this.clients.get(clientId);
+      
+      // Initialize client's subscriptions for this stream type if needed
+      if (!client.subscriptions.has(streamType)) {
+        client.subscriptions.set(streamType, new Set());
+      }
+      
+      // Add special ALL symbol to client's subscriptions (using lowercase for consistency)
+      client.subscriptions.get(streamType).add('all');
+      
+      // Initialize subscriptions for this symbol if needed
+      const key = `${streamType}:all`;
+      if (!this.subscriptions.has(key)) {
+        this.subscriptions.set(key, new Set());
+      }
+      
+      // Add client to symbol's subscribers
+      this.subscriptions.get(key).add(clientId);
+      
+      // Subscribe to ALL symbols via worker manager
+      logger.info(`Requesting worker manager to subscribe to ALL symbols for ${streamType}`);
+      this.workerManager.subscribeToAllSymbols(streamType, options)
+        .then(symbols => {
+          logger.info(`Successfully subscribed to ${symbols.length} symbols for ${streamType}`);
+        })
+        .catch(err => {
+          logger.error(`Failed to subscribe to ALL symbols: ${err.message}`);
+        });
+      
+      // Acknowledge the subscription
+      this._sendToClient(client.ws, {
+        type: 'subscribed',
+        streamType,
+        symbols: ['ALL']
+      });
+      
+      return;
+    }
+    
+    // Regular symbol subscription
+    if (symbols.length === 0) {
+      this._sendErrorToClient(clientId, 'Symbol list must be non-empty');
       return;
     }
     
@@ -591,74 +675,35 @@ export class WSServer {
    */
   _handleMarketData(streamType, data) {
     // Extract symbol from data
-    let symbol;
-    let rawStream;
+    let symbol = '';
     
-    if (data.stream) {
-      // Raw stream format (e.g., "btcusdt@kline_1m")
-      rawStream = data.stream;
-      
-      // Extract symbol from stream field (e.g., "btcusdt@kline_1m")
-      const parts = data.stream.split('@');
-      symbol = parts[0];
-    } else if (data.s) {
-      // Extract from symbol field (e.g., data.s = "BTCUSDT")
-      symbol = data.s.toLowerCase();
-      
-      // Create raw stream name
-      if (streamType === 'kline' && data.k && data.k.i) {
-        rawStream = `${symbol}@kline_${data.k.i}`;
-      } else if (streamType === 'depth') {
-        rawStream = `${symbol}@depth`;
-      } else if (streamType === 'ticker') {
-        rawStream = `${symbol}@ticker`;
-      } else if (streamType === 'markPrice') {
-        rawStream = `${symbol}@markPrice`;
-      }
-    } else if (streamType === 'liquidation') {
-      rawStream = '!forceOrder@arr';
-      // For liquidation events, get symbol from the order
-      if (data.data && data.data.o && data.data.o.s) {
+    try {
+      if (data.s) {
+        symbol = data.s.toLowerCase();
+      } else if (data.data && data.data.s) {
+        symbol = data.data.s.toLowerCase();
+      } else if (data.stream) {
+        // Extract symbol from stream name (e.g., btcusdt@kline_1m)
+        const parts = data.stream.split('@');
+        symbol = parts[0].toLowerCase();
+      } else if (streamType === 'liquidation' && data.data && data.data.o && data.data.o.s) {
+        // Liquidation data
         symbol = data.data.o.s.toLowerCase();
+      } else {
+        logger.warn('Could not extract symbol from data');
+        return;
       }
-    }
-    
-    if (!symbol && !rawStream) {
-      logger.warn(`Cannot extract symbol from ${streamType} data`);
-      return;
-    }
-    
-    // Handle raw stream subscriptions
-    if (rawStream && this.rawSubscriptions.has(rawStream)) {
-      const subscribers = this.rawSubscriptions.get(rawStream);
       
-      // Send data to all subscribed clients
-      for (const clientId of subscribers) {
-        const client = this.clients.get(clientId);
+      // Send to clients subscribed to this symbol
+      const key = `${streamType}:${symbol}`;
+      
+      if (this.subscriptions.has(key)) {
+        const clients = this.subscriptions.get(key);
         
-        if (client && client.ws.readyState === 1) { // 1 = OPEN
-          this._sendToClient(client.ws, {
-            type: streamType,
-            stream: rawStream,
-            data
-          });
-        }
-      }
-    }
-    
-    // Handle regular subscriptions
-    if (symbol) {
-      // Check if any clients are subscribed to this symbol and stream type
-      if (this.subscriptions.has(symbol) && 
-          this.subscriptions.get(symbol).has(streamType)) {
-        
-        const subscribers = this.subscriptions.get(symbol).get(streamType);
-        
-        // Send data to all subscribed clients
-        for (const clientId of subscribers) {
+        for (const clientId of clients) {
           const client = this.clients.get(clientId);
           
-          if (client && client.ws.readyState === 1) { // 1 = OPEN
+          if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
             this._sendToClient(client.ws, {
               type: streamType,
               data
@@ -666,6 +711,68 @@ export class WSServer {
           }
         }
       }
+      
+      // Send to clients subscribed to ALL symbols
+      const allKey = `${streamType}:all`;
+      
+      if (this.subscriptions.has(allKey)) {
+        const clients = this.subscriptions.get(allKey);
+        logger.debug(`Sending ${streamType} data for ${symbol} to ${clients.size} clients subscribed to ALL symbols`);
+        
+        for (const clientId of clients) {
+          const client = this.clients.get(clientId);
+          
+          if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
+            this._sendToClient(client.ws, {
+              type: streamType,
+              data
+            });
+          }
+        }
+      }
+      
+      // Send to clients with raw subscriptions
+      // Check if any clients are subscribed to the raw stream
+      if (data.stream) {
+        const rawStream = data.stream;
+        
+        if (this.rawSubscriptions.has(rawStream)) {
+          const clients = this.rawSubscriptions.get(rawStream);
+          
+          for (const clientId of clients) {
+            const client = this.clients.get(clientId);
+            
+            if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
+              this._sendToClient(client.ws, {
+                stream: rawStream,
+                data
+              });
+            }
+          }
+        }
+      }
+      
+      // For liquidation events, send to clients subscribed to the global liquidation stream
+      if (streamType === 'liquidation') {
+        const globalKey = `liquidation:_global_`;
+        
+        if (this.subscriptions.has(globalKey)) {
+          const clients = this.subscriptions.get(globalKey);
+          
+          for (const clientId of clients) {
+            const client = this.clients.get(clientId);
+            
+            if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
+              this._sendToClient(client.ws, {
+                type: 'liquidation',
+                data
+              });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logger.error(`Error handling market data for ${streamType}`, error);
     }
   }
 
@@ -721,6 +828,59 @@ export class WSServer {
       // Close server
       this.server.close();
       this.server = null;
+    }
+  }
+
+  /**
+   * Handle request for historical klines data
+   */
+  async _handleHistoricalKlinesRequest(clientId, data) {
+    const { symbol, interval, limit, startTime, endTime, isFutures } = data;
+    
+    // Validate required parameters
+    if (!symbol) {
+      this._sendErrorToClient(clientId, 'Symbol is required');
+      return;
+    }
+    
+    if (!interval) {
+      this._sendErrorToClient(clientId, 'Interval is required');
+      return;
+    }
+    
+    logger.info(`Client ${clientId} requesting historical klines for ${symbol} (${interval})`);
+    
+    const client = this.clients.get(clientId);
+    
+    try {
+      // Create a BinanceService instance to fetch historical data
+      const binanceService = new BinanceService();
+      
+      // Enforce lower limit to reduce load
+      const actualLimit = Math.min(limit || 1000, 1000);
+      
+      // Fetch historical data
+      const klines = await binanceService.fetchHistoricalKlines(
+        symbol, 
+        interval, 
+        actualLimit, 
+        startTime, 
+        endTime, 
+        isFutures
+      );
+      
+      // Send response to client
+      this._sendToClient(client.ws, {
+        type: MESSAGE_TYPES.HISTORICAL_KLINES,
+        symbol,
+        interval,
+        klines
+      });
+      
+      logger.info(`Sent ${klines.length} historical klines to client ${clientId}`);
+    } catch (error) {
+      logger.error(`Error fetching historical klines for client ${clientId}`, error);
+      this._sendErrorToClient(clientId, `Failed to fetch historical klines: ${error.message}`);
     }
   }
 } 
