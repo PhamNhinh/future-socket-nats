@@ -15,8 +15,13 @@ export class WSServer {
     this.workerManager = workerManager;
     this.server = null;
     this.clients = new Map(); // Map<clientId, { ws, subscriptions }>
-    this.subscriptions = new Map(); // Map<symbol, Set<clientId>>
-    this.rawSubscriptions = new Map(); // Map<rawStreamName, Set<clientId>>
+    
+    // Update subscriptions structure to include options
+    // Map<symbol, Map<streamType, Map<optionsKey, Set<clientId>>>>
+    // optionsKey is a stringified version of options, e.g. "interval:15m" or "level:1"
+    this.subscriptions = new Map();
+    
+    this.rawSubscriptions = new Map();
   }
 
   /**
@@ -421,16 +426,17 @@ export class WSServer {
       return;
     }
     
-    logger.info(`Client ${clientId} subscribing to ${streamType} for ${symbols.length} symbols`);
+    logger.info(`Client ${clientId} subscribing to ${streamType} for ${symbols.length} symbols with options:`, options);
     
     const client = this.clients.get(clientId);
     
-    // Initialize client's subscriptions for this stream type if needed
+    // Initialize client's subscriptions if needed
     if (!client.subscriptions.has(streamType)) {
-      client.subscriptions.set(streamType, new Set());
+      client.subscriptions.set(streamType, new Map());
     }
     
-    const clientStreamSubscriptions = client.subscriptions.get(streamType);
+    // Generate options key for tracking
+    const optionsKey = this._generateOptionsKey(streamType, options);
     
     // Track which symbols are newly subscribed
     const newSymbols = [];
@@ -439,26 +445,31 @@ export class WSServer {
     symbols.forEach(symbol => {
       const lowercaseSymbol = symbol.toLowerCase();
       
-      // Add to client's subscriptions
-      if (!clientStreamSubscriptions.has(lowercaseSymbol)) {
-        clientStreamSubscriptions.add(lowercaseSymbol);
-        newSymbols.push(lowercaseSymbol);
+      // Initialize symbol in client's subscriptions
+      const clientStreamSubs = client.subscriptions.get(streamType);
+      if (!clientStreamSubs.has(lowercaseSymbol)) {
+        clientStreamSubs.set(lowercaseSymbol, new Set());
       }
+      clientStreamSubs.get(lowercaseSymbol).add(optionsKey);
       
-      // Initialize symbol subscriptions if needed
+      // Initialize global subscriptions tracking
       if (!this.subscriptions.has(lowercaseSymbol)) {
         this.subscriptions.set(lowercaseSymbol, new Map());
       }
       
-      const symbolSubscriptions = this.subscriptions.get(lowercaseSymbol);
-      
-      // Initialize stream type for this symbol if needed
-      if (!symbolSubscriptions.has(streamType)) {
-        symbolSubscriptions.set(streamType, new Set());
+      const symbolSubs = this.subscriptions.get(lowercaseSymbol);
+      if (!symbolSubs.has(streamType)) {
+        symbolSubs.set(streamType, new Map());
       }
       
-      // Add client to symbol's subscribers
-      symbolSubscriptions.get(streamType).add(clientId);
+      const streamTypeSubs = symbolSubs.get(streamType);
+      if (!streamTypeSubs.has(optionsKey)) {
+        streamTypeSubs.set(optionsKey, new Set());
+        newSymbols.push(lowercaseSymbol);
+      }
+      
+      // Add client to subscribers
+      streamTypeSubs.get(optionsKey).add(clientId);
     });
     
     // Subscribe to new symbols via worker manager
@@ -470,84 +481,159 @@ export class WSServer {
     this._sendToClient(client.ws, {
       type: 'subscribed',
       streamType,
-      symbols
+      symbols,
+      options
     });
+  }
+
+  /**
+   * Generate a unique key for tracking options
+   */
+  _generateOptionsKey(streamType, options) {
+    const parts = [];
+    
+    switch (streamType) {
+      case 'kline':
+        if (options.interval) parts.push(`interval:${options.interval}`);
+        break;
+      case 'depth':
+        if (options.level) parts.push(`level:${options.level}`);
+        break;
+      case 'markPrice':
+        if (options.updateSpeed) parts.push(`speed:${options.updateSpeed}`);
+        break;
+      // Add other stream types as needed
+    }
+    
+    return parts.length > 0 ? parts.join('|') : 'default';
   }
 
   /**
    * Handle a client's unsubscribe request
    */
   _handleUnsubscribe(clientId, data) {
-    const { streamType, symbols } = data;
+    const { streamType, symbols, options = {} } = data;
     
-    // Validate stream type
-    if (!STREAM_TYPES.includes(streamType)) {
-      this._sendErrorToClient(clientId, `Invalid stream type: ${streamType}`);
-      return;
-    }
-    
-    // Validate symbols
-    if (!Array.isArray(symbols) || symbols.length === 0) {
-      this._sendErrorToClient(clientId, 'Symbols must be a non-empty array');
+    // Validate inputs
+    if (!this._validateUnsubscribeInput(clientId, streamType, symbols)) {
       return;
     }
     
     logger.info(`Client ${clientId} unsubscribing from ${streamType} for ${symbols.length} symbols`);
     
     const client = this.clients.get(clientId);
+    const clientStreamSubs = client.subscriptions.get(streamType);
+    const optionsKey = this._generateOptionsKey(streamType, options);
     
-    // Check if client is subscribed to this stream type
-    if (!client.subscriptions.has(streamType)) {
-      this._sendErrorToClient(clientId, `Not subscribed to stream type: ${streamType}`);
-      return;
+    // Process unsubscriptions and collect symbols that need worker updates
+    const symbolsToUnsubscribe = this._processUnsubscriptions(
+      symbols, 
+      clientId,
+      streamType,
+      clientStreamSubs,
+      optionsKey
+    );
+    
+    // Update worker subscriptions if needed
+    if (symbolsToUnsubscribe.length > 0) {
+      this.workerManager.unsubscribeFromStream(streamType, symbolsToUnsubscribe, options);
     }
     
-    const clientStreamSubscriptions = client.subscriptions.get(streamType);
+    this._sendToClient(client.ws, {
+      type: 'unsubscribed',
+      streamType,
+      symbols,
+      options
+    });
+  }
+
+  /**
+   * Validate unsubscribe request inputs
+   */
+  _validateUnsubscribeInput(clientId, streamType, symbols) {
+    if (!Object.values(STREAM_TYPES).includes(streamType)) {
+      this._sendErrorToClient(clientId, `Invalid stream type: ${streamType}`);
+      return false;
+    }
     
-    // Track which symbols need to be unsubscribed at the worker level
-    const symbolsToUnsubscribe = [];
+    if (!Array.isArray(symbols) || symbols.length === 0) {
+      this._sendErrorToClient(clientId, 'Symbols must be a non-empty array');
+      return false;
+    }
     
-    // Update subscriptions tracking
+    const client = this.clients.get(clientId);
+    if (!client.subscriptions.has(streamType)) {
+      this._sendErrorToClient(clientId, `Not subscribed to stream type: ${streamType}`);
+      return false;
+    }
+    
+    return true;
+  }
+
+  /**
+   * Process unsubscriptions and return symbols needing worker updates
+   */
+  _processUnsubscriptions(symbols, clientId, streamType, clientStreamSubs, optionsKey) {
+    const symbolsToUnsubscribe = new Set();
+
     symbols.forEach(symbol => {
       const lowercaseSymbol = symbol.toLowerCase();
       
       // Remove from client's subscriptions
-      clientStreamSubscriptions.delete(lowercaseSymbol);
+      this._removeClientSubscription(clientStreamSubs, lowercaseSymbol, optionsKey);
       
-      // Check if symbol exists in subscriptions
-      if (this.subscriptions.has(lowercaseSymbol)) {
-        const symbolSubscriptions = this.subscriptions.get(lowercaseSymbol);
-        
-        // Check if stream type exists for this symbol
-        if (symbolSubscriptions.has(streamType)) {
-          // Remove client from symbol's subscribers
-          symbolSubscriptions.get(streamType).delete(clientId);
-          
-          // If no clients left for this stream type, mark for unsubscribe
-          if (symbolSubscriptions.get(streamType).size === 0) {
-            symbolsToUnsubscribe.push(lowercaseSymbol);
-            symbolSubscriptions.delete(streamType);
-          }
-          
-          // If no stream types left for this symbol, remove symbol
-          if (symbolSubscriptions.size === 0) {
-            this.subscriptions.delete(lowercaseSymbol);
-          }
-        }
+      // Update global subscriptions and check if worker update needed
+      if (this._removeGlobalSubscription(lowercaseSymbol, streamType, clientId, optionsKey)) {
+        symbolsToUnsubscribe.add(lowercaseSymbol);
       }
     });
+
+    return Array.from(symbolsToUnsubscribe);
+  }
+
+  /**
+   * Remove subscription from client's tracking
+   */
+  _removeClientSubscription(clientStreamSubs, symbol, optionsKey) {
+    if (!clientStreamSubs.has(symbol)) return;
     
-    // Unsubscribe from symbols at the worker level
-    if (symbolsToUnsubscribe.length > 0) {
-      this.workerManager.unsubscribeFromStream(streamType, symbolsToUnsubscribe);
+    const optionSets = clientStreamSubs.get(symbol);
+    optionSets.delete(optionsKey);
+    
+    if (optionSets.size === 0) {
+      clientStreamSubs.delete(symbol);
+    }
+  }
+
+  /**
+   * Remove subscription from global tracking
+   * Returns true if worker update needed
+   */
+  _removeGlobalSubscription(symbol, streamType, clientId, optionsKey) {
+    if (!this.subscriptions.has(symbol)) return false;
+    
+    const symbolSubs = this.subscriptions.get(symbol);
+    if (!symbolSubs.has(streamType)) return false;
+    
+    const streamTypeSubs = symbolSubs.get(streamType);
+    if (!streamTypeSubs.has(optionsKey)) return false;
+    
+    const subscribers = streamTypeSubs.get(optionsKey);
+    subscribers.delete(clientId);
+    
+    if (subscribers.size === 0) {
+      streamTypeSubs.delete(optionsKey);
+      
+      if (streamTypeSubs.size === 0) {
+        symbolSubs.delete(streamType);
+        if (symbolSubs.size === 0) {
+          this.subscriptions.delete(symbol);
+        }
+        return true;
+      }
     }
     
-    // Acknowledge the unsubscription
-    this._sendToClient(client.ws, {
-      type: 'unsubscribed',
-      streamType,
-      symbols
-    });
+    return false;
   }
 
   /**
@@ -557,87 +643,90 @@ export class WSServer {
     logger.info(`Client disconnected: ${clientId}`);
     
     const client = this.clients.get(clientId);
+    if (!client) return;
+
+    // Process standard subscriptions
+    this._cleanupClientSubscriptions(client, clientId);
     
-    if (!client) {
-      return;
-    }
-    
-    // Handle standard subscriptions
-    for (const [streamType, symbols] of client.subscriptions.entries()) {
-      // Track which symbols need to be unsubscribed at the worker level
-      const symbolsToUnsubscribe = [];
-      
-      // For each symbol in this stream type
-      for (const symbol of symbols) {
-        // Check if symbol exists in subscriptions
-        if (this.subscriptions.has(symbol)) {
-          const symbolSubscriptions = this.subscriptions.get(symbol);
-          
-          // Check if stream type exists for this symbol
-          if (symbolSubscriptions.has(streamType)) {
-            // Remove client from symbol's subscribers
-            symbolSubscriptions.get(streamType).delete(clientId);
-            
-            // If no clients left for this stream type, mark for unsubscribe
-            if (symbolSubscriptions.get(streamType).size === 0) {
-              symbolsToUnsubscribe.push(symbol);
-              symbolSubscriptions.delete(streamType);
-            }
-            
-            // If no stream types left for this symbol, remove symbol
-            if (symbolSubscriptions.size === 0) {
-              this.subscriptions.delete(symbol);
-            }
-          }
-        }
-      }
-      
-      // Unsubscribe from symbols at the worker level
-      if (symbolsToUnsubscribe.length > 0) {
-        this.workerManager.unsubscribeFromStream(streamType, symbolsToUnsubscribe);
-      }
-    }
-    
-    // Handle raw subscriptions
-    if (client.rawSubscriptions.size > 0) {
-      const rawStreamsToUnsubscribe = new Map(); // Map<streamType, symbol[]>
-      
-      for (const stream of client.rawSubscriptions) {
-        if (this.rawSubscriptions.has(stream)) {
-          // Remove client from raw stream's subscribers
-          this.rawSubscriptions.get(stream).delete(clientId);
-          
-          // If no clients left for this stream, unsubscribe
-          if (this.rawSubscriptions.get(stream).size === 0) {
-            const parsedStream = this._parseRawStream(stream);
-            if (parsedStream) {
-              const { streamType, symbol } = parsedStream;
-              
-              if (!rawStreamsToUnsubscribe.has(streamType)) {
-                rawStreamsToUnsubscribe.set(streamType, []);
-              }
-              
-              if (symbol) {
-                rawStreamsToUnsubscribe.get(streamType).push(symbol);
-              }
-            }
-            
-            // Remove stream from raw subscriptions
-            this.rawSubscriptions.delete(stream);
-          }
-        }
-      }
-      
-      // Unsubscribe from raw streams at the worker level
-      for (const [streamType, symbols] of rawStreamsToUnsubscribe.entries()) {
-        if (symbols.length > 0) {
-          this.workerManager.unsubscribeFromStream(streamType, symbols);
-        }
-      }
-    }
+    // Process raw subscriptions
+    this._cleanupRawSubscriptions(client, clientId);
     
     // Remove client
     this.clients.delete(clientId);
+  }
+
+  /**
+   * Clean up client's standard subscriptions
+   */
+  _cleanupClientSubscriptions(client, clientId) {
+    // Group unsubscriptions by stream type and options
+    const unsubscribeGroups = new Map(); // Map<streamType, Map<optionsKey, Set<symbol>>>
+
+    for (const [streamType, symbolMap] of client.subscriptions.entries()) {
+      for (const [symbol, optionSets] of symbolMap.entries()) {
+        for (const optionsKey of optionSets) {
+          if (this._removeGlobalSubscription(symbol, streamType, clientId, optionsKey)) {
+            // Add to unsubscribe group
+            if (!unsubscribeGroups.has(streamType)) {
+              unsubscribeGroups.set(streamType, new Map());
+            }
+            const streamGroup = unsubscribeGroups.get(streamType);
+            if (!streamGroup.has(optionsKey)) {
+              streamGroup.set(optionsKey, new Set());
+            }
+            streamGroup.get(optionsKey).add(symbol);
+          }
+        }
+      }
+    }
+
+    // Process unsubscribe groups
+    for (const [streamType, optionsMap] of unsubscribeGroups.entries()) {
+      for (const [optionsKey, symbols] of optionsMap.entries()) {
+        if (symbols.size > 0) {
+          const options = this._parseOptionsFromKey(optionsKey);
+          this.workerManager.unsubscribeFromStream(streamType, Array.from(symbols), options);
+        }
+      }
+    }
+  }
+
+  /**
+   * Clean up client's raw subscriptions
+   */
+  _cleanupRawSubscriptions(client, clientId) {
+    if (client.rawSubscriptions.size === 0) return;
+    
+    const unsubscribeByType = new Map(); // Map<streamType, Set<symbol>>
+    
+    for (const stream of client.rawSubscriptions) {
+      if (!this.rawSubscriptions.has(stream)) continue;
+      
+      const subscribers = this.rawSubscriptions.get(stream);
+      subscribers.delete(clientId);
+      
+      if (subscribers.size === 0) {
+        const parsed = this._parseRawStream(stream);
+        if (!parsed) continue;
+        
+        const { streamType, symbol } = parsed;
+        if (!unsubscribeByType.has(streamType)) {
+          unsubscribeByType.set(streamType, new Set());
+        }
+        if (symbol) {
+          unsubscribeByType.get(streamType).add(symbol);
+        }
+        
+        this.rawSubscriptions.delete(stream);
+      }
+    }
+    
+    // Process unsubscriptions by stream type
+    for (const [streamType, symbols] of unsubscribeByType.entries()) {
+      if (symbols.size > 0) {
+        this.workerManager.unsubscribeFromStream(streamType, Array.from(symbols));
+      }
+    }
   }
 
   /**
@@ -694,20 +783,28 @@ export class WSServer {
         return;
       }
       
-      // Send to clients subscribed to this symbol
-      const key = `${streamType}:${symbol}`;
+      // Extract options from data
+      const options = this._parseOptions(streamType, data);
+      const optionsKey = this._generateOptionsKey(streamType, options);
       
-      if (this.subscriptions.has(key)) {
-        const clients = this.subscriptions.get(key);
-        
-        for (const clientId of clients) {
-          const client = this.clients.get(clientId);
+      // Check subscriptions and send to relevant clients
+      if (this.subscriptions.has(symbol)) {
+        const symbolSubs = this.subscriptions.get(symbol);
+        if (symbolSubs.has(streamType)) {
+          const streamTypeSubs = symbolSubs.get(streamType);
           
-          if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
-            this._sendToClient(client.ws, {
-              type: streamType,
-              data
-            });
+          // Send to clients subscribed with matching options
+          if (streamTypeSubs.has(optionsKey)) {
+            const clients = streamTypeSubs.get(optionsKey);
+            for (const clientId of clients) {
+              const client = this.clients.get(clientId);
+              if (client?.ws?.readyState === WebSocket.OPEN) {
+                this._sendToClient(client.ws, {
+                  type: streamType,
+                  data
+                });
+              }
+            }
           }
         }
       }
@@ -882,5 +979,47 @@ export class WSServer {
       logger.error(`Error fetching historical klines for client ${clientId}`, error);
       this._sendErrorToClient(clientId, `Failed to fetch historical klines: ${error.message}`);
     }
+  }
+
+  _parseOptions(streamType, data) {
+    switch (streamType) {
+      case 'kline':
+        return { interval: data.data.k.i }; 
+      case 'depth':
+        return { level: data.level };
+      case 'markPrice':
+        return { updateSpeed: data.updateSpeed };
+      case 'liquidation':
+        return {};
+        
+    }
+  }
+
+  /**
+   * Parse options from an options key
+   * @private
+   */
+  _parseOptionsFromKey(optionsKey) {
+    if (optionsKey === 'default') return {};
+    
+    const options = {};
+    const parts = optionsKey.split('|');
+    
+    parts.forEach(part => {
+      const [key, value] = part.split(':');
+      switch (key) {
+        case 'interval':
+          options.interval = value;
+          break;
+        case 'level':
+          options.level = parseInt(value);
+          break;
+        case 'speed':
+          options.updateSpeed = value;
+          break;
+      }
+    });
+    
+    return options;
   }
 } 

@@ -108,7 +108,7 @@ async function handleSubscribeRequest(message) {
     return;
   }
   
-  logger.info(`Subscribing to ${streamType} for ${symbolsToSubscribe.length} symbols`);
+  logger.info(`Subscribing to ${streamType} for ${symbolsToSubscribe.length} symbols`, options);
   
   // Create streams list
   let streams;

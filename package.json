@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "WebSocket proxy service for Binance market data using NATS for distributed messaging",
   "main": "src/index.js",
+  "type": "module",
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
@@ -28,6 +29,7 @@
     "axios": "^0.27.2",
     "dotenv": "^16.0.1",
     "nats": "^2.7.1",
+    "node-fetch": "^3.3.2",
     "pino": "^8.0.0",
     "pino-pretty": "^8.0.0",
     "ws": "^8.8.0"

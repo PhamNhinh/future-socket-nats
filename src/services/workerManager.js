@@ -103,7 +103,7 @@ export class WorkerManager {
           logger.info(`Processing subscribe batch ${Math.floor(i / MAX_BATCH_SIZE) + 1}/${Math.ceil(symbolsArray.length / MAX_BATCH_SIZE)} for ${streamType} (${batch.length} symbols)`);
           
           // Process this batch
-          await this._processSubscribeBatch(streamType, batch);
+          await this._processSubscribeBatch(streamType, batch, this.streamOptions[streamType]);
           
           // Introduce a small delay between batches to avoid overwhelming the connection
           if (i + MAX_BATCH_SIZE < symbolsArray.length) {

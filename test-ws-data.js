@@ -1,5 +1,5 @@
 const WebSocket = require('ws');
-const ws = new WebSocket('wss://bnb-socket.docserver.name');
+const ws = new WebSocket('wss://bnb-socket.docserver.name/future');
 
 ws.on('open', () => {
   console.log('Kết nối thành công!');
@@ -8,7 +8,7 @@ ws.on('open', () => {
   const testData = {
     type: 'subscribe',
     streamType: 'kline',
-    symbols: ['btcusdt'],
+    symbols: ['BTCUSDT'],
     interval: '1m'
   };
   
